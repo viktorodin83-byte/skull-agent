@@ -8,6 +8,8 @@ bot.pid
 bot_run.log
 watchdog.log
 gold_signal_history.json
+skullbyte_history.json
+skullbyte_run.log
 
 # Старые сборки/архивы
 dist/

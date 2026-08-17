@@ -13,8 +13,11 @@ SkullByte — отдельный Telegram-агент, только для глу
 """
 
 import asyncio
+import json
 import logging
 import os
+import re
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -38,6 +41,16 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 UNIRATE_API_KEY = os.getenv("UNIRATE_API_KEY")
 
 ADVISOR_MODEL = "claude-opus-5"
+
+# Самообучение: своя история, отдельная от gold_signal_history.json старого бота.
+# Тот же принцип — логируем каждый прогноз, через EVAL_HORIZON_HOURS сверяем
+# с реальным движением цены, считаем точность по последним ACCURACY_WINDOW
+# проверенным прогнозам и сообщаем её и пользователю, и самому Claude (чтобы
+# он калибровал уверенность формулировок под свой реальный track record).
+_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skullbyte_history.json")
+_EVAL_HORIZON_HOURS = 4
+_MOVE_THRESHOLD_PCT = 0.1
+_ACCURACY_WINDOW = 20
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -217,6 +230,68 @@ def fetch_gold_silver() -> dict:
         return {}
 
 
+# ---------- Самообучение (своя история, отдельная от старого бота) ----------
+
+def _load_history() -> list:
+    if not os.path.exists(_HISTORY_FILE):
+        return []
+    try:
+        with open(_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"[skullbyte] Ошибка чтения истории прогнозов: {e}")
+        return []
+
+
+def _save_history(history: list):
+    try:
+        with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history[-500:], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"[skullbyte] Ошибка сохранения истории прогнозов: {e}")
+
+
+def _evaluate_pending(history: list, current_price: float):
+    """Сверяет прогнозы старше _EVAL_HORIZON_HOURS с реальным движением цены."""
+    now = datetime.now(timezone.utc)
+    for entry in history:
+        if entry["evaluated"]:
+            continue
+        ts = datetime.fromisoformat(entry["timestamp"])
+        hours_passed = (now - ts).total_seconds() / 3600
+        if hours_passed < _EVAL_HORIZON_HOURS:
+            continue
+        entry["evaluated"] = True
+        move_pct = (current_price - entry["price"]) / entry["price"] * 100
+        if entry["direction"] == "бычье":
+            entry["correct"] = move_pct >= _MOVE_THRESHOLD_PCT
+        elif entry["direction"] == "медвежье":
+            entry["correct"] = move_pct <= -_MOVE_THRESHOLD_PCT
+        else:
+            entry["correct"] = abs(move_pct) < _MOVE_THRESHOLD_PCT
+
+
+def _recent_accuracy(history: list) -> float | None:
+    evaluated = [e for e in history if e["evaluated"] and e["correct"] is not None]
+    if not evaluated:
+        return None
+    recent = evaluated[-_ACCURACY_WINDOW:]
+    return sum(1 for e in recent if e["correct"]) / len(recent)
+
+
+def _extract_direction(analysis_text: str) -> tuple[str, str]:
+    """Достаёт машиночитаемую метку SIGNAL: ... из ответа Claude и убирает
+    её из текста, который увидит пользователь. Возвращает (направление, чистый_текст).
+    """
+    match = re.search(r"\n?SIGNAL:\s*(BULLISH|BEARISH|NEUTRAL)\s*$", analysis_text.strip())
+    if not match:
+        return "нейтральное", analysis_text
+    direction_map = {"BULLISH": "бычье", "BEARISH": "медвежье", "NEUTRAL": "нейтральное"}
+    direction = direction_map[match.group(1)]
+    clean_text = analysis_text[: match.start()].strip()
+    return direction, clean_text
+
+
 # ---------- Синтез ----------
 
 def _macd_atr_note(macd_data: dict | None, atr_value: float | None) -> str:
@@ -291,7 +366,7 @@ def build_data_summary(
     return "\n".join(parts)
 
 
-def ask_claude_synthesis(data_summary: str) -> str:
+def ask_claude_synthesis(data_summary: str, accuracy: float | None) -> str:
     """Просит Claude (с доступом к веб-поиску) свести всё в единый разбор для пользователя."""
     url = "https://api.anthropic.com/v1/messages"
     headers = {
@@ -299,10 +374,18 @@ def ask_claude_synthesis(data_summary: str) -> str:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    accuracy_note = (
+        f"\n\nСправка: точность твоих последних {_ACCURACY_WINDOW} прогнозов (сверено с реальным "
+        f"движением цены через {_EVAL_HORIZON_HOURS}ч) — {accuracy:.0%}. "
+        + ("Точность просела — формулируй направление осторожнее, явно проговаривай неопределённость."
+           if accuracy is not None and accuracy < 0.5 else "")
+    ) if accuracy is not None else ""
+
     user_prompt = (
         "Ты аналитик по золоту (XAU/USD) для дневного трейдера (до 5 сделок в день, "
         "внутри дня, не позиционная торговля). Вот сырые данные, собранные только что:\n\n"
-        f"{data_summary}\n\n"
+        f"{data_summary}"
+        f"{accuracy_note}\n\n"
         "Проверь через веб-поиск текущий новостной и макроэкономический фон (ставки ФРС, "
         "инфляционная статистика, геополитика). Отдельно найди экономический календарь "
         "на СЕГОДНЯ — важно узнать ТОЧНОЕ время публикаций (укажи по МСК), а не только "
@@ -313,7 +396,11 @@ def ask_claude_synthesis(data_summary: str) -> str:
         "4. Конкретные уровни для входа/стопа — используй присланные пивоты и текущую "
         "сессию, дай практические цифры (например 'вход от S1, стоп ниже S2'), а не общие слова.\n"
         "5. Риски сегодня — события с ТОЧНЫМ временем по МСК, если оно есть в календаре.\n"
-        "Пиши сжато, по существу, без лишних вступлений."
+        "Пиши сжато, по существу, без лишних вступлений.\n\n"
+        "В САМОМ КОНЦЕ ответа, отдельной последней строкой, добавь СТРОГО в этом формате "
+        "(это для автоматической обработки, не для пользователя, но её всё равно нужно написать): "
+        "SIGNAL: BULLISH — если направление из пункта 1 бычье, SIGNAL: BEARISH — если медвежье, "
+        "SIGNAL: NEUTRAL — если нейтральное."
     )
     payload = {
         "model": ADVISOR_MODEL,
@@ -357,14 +444,34 @@ async def run_full_analysis() -> str:
     pivots = pivot_points(candles_1d)
     session = current_session()
 
+    # Самообучение: сверяем прошлые прогнозы с текущей ценой ДО того, как спросим
+    # Claude — так свежая точность попадает в промпт этого же запроса.
+    current_price = signal_1h["price"]
+    history = _load_history()
+    _evaluate_pending(history, current_price)
+    accuracy = _recent_accuracy(history)
+
     data_summary = build_data_summary(
         signal_15m, signal_1h, signal_1d, real_yield, metals,
         macd_15m, atr_15m, macd_1h, atr_1h, macd_1d, atr_1d,
         pivots, session,
     )
-    analysis_text = await asyncio.to_thread(ask_claude_synthesis, data_summary)
+    raw_analysis = await asyncio.to_thread(ask_claude_synthesis, data_summary, accuracy)
+    direction, analysis_text = _extract_direction(raw_analysis)
 
-    return f"🪙 Разбор по XAU/USD\n\n{analysis_text}"
+    history.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "direction": direction,
+        "price": current_price,
+        "evaluated": False,
+        "correct": None,
+    })
+    _save_history(history)
+
+    footer = f"\n\n📊 Точность последних прогнозов: {accuracy:.0%}" if accuracy is not None else (
+        "\n\n📊 Точность прогнозов: пока недостаточно данных (нужно время)"
+    )
+    return f"🪙 Разбор по XAU/USD\n\n{analysis_text}{footer}"
 
 
 # ---------- Telegram-обработчики ----------
