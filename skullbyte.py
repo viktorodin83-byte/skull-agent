@@ -95,6 +95,49 @@ def atr(candles: list[Candle], period: int = 14) -> float | None:
     return round(sum(true_ranges[-period:]) / period, 2)
 
 
+def pivot_points(candles_1d: list[Candle], min_range: float = 15.0) -> dict | None:
+    """Классические дневные пивоты (PP/R1/R2/S1/S2) от последнего ПОЛНОЦЕННОГО
+    торгового дня — конкретные внутридневные уровни для входов и стопов.
+
+    candles_1d[-1] — сегодняшняя (ещё формирующаяся) свеча, пропускаем её всегда.
+    Дальше идём назад и пропускаем "мёртвые" сессии (суббота, вечер воскресенья
+    перед открытием) — у них диапазон high-low в разы уже нормального дня для
+    золота, пивоты от них получаются бессмысленно узкими. Берём первый день
+    с нормальным диапазоном — обычно это пятница, если сейчас выходные/понедельник.
+    """
+    for i in range(len(candles_1d) - 2, -1, -1):
+        c = candles_1d[i]
+        if (c.high - c.low) >= min_range:
+            pp = (c.high + c.low + c.close) / 3
+            span = c.high - c.low
+            return {
+                "r2": round(pp + span, 2),
+                "r1": round(2 * pp - c.low, 2),
+                "pp": round(pp, 2),
+                "s1": round(2 * pp - c.high, 2),
+                "s2": round(pp - span, 2),
+            }
+    return None
+
+
+def current_session() -> str:
+    """Текущая торговая сессия по UTC — золото по-разному волатильно в разные сессии."""
+    from datetime import datetime, timezone
+
+    hour = datetime.now(timezone.utc).hour
+    in_london = 7 <= hour < 16
+    in_ny = 12 <= hour < 21
+    if in_london and in_ny:
+        return "перекрытие Лондон/Нью-Йорк (12:00-16:00 UTC, максимальная ликвидность и волатильность)"
+    if in_london:
+        return "Лондонская сессия (07:00-16:00 UTC)"
+    if in_ny:
+        return "Нью-Йоркская сессия (12:00-21:00 UTC)"
+    if 0 <= hour < 9:
+        return "Азиатская сессия (00:00-09:00 UTC, обычно ниже волатильность по золоту)"
+    return "затишье между сессиями (Нью-Йорк закрылся, Лондон/Азия ещё не открылись)"
+
+
 # ---------- Сбор данных ----------
 
 def fetch_candles(interval: str, outputsize: int = 110) -> list[Candle]:
@@ -188,13 +231,21 @@ def _macd_atr_note(macd_data: dict | None, atr_value: float | None) -> str:
 
 
 def build_data_summary(
-    signal_1h: dict, signal_1d: dict, real_yield: dict, metals: dict,
+    signal_15m: dict, signal_1h: dict, signal_1d: dict, real_yield: dict, metals: dict,
+    macd_15m: dict | None = None, atr_15m: float | None = None,
     macd_1h: dict | None = None, atr_1h: float | None = None,
     macd_1d: dict | None = None, atr_1d: float | None = None,
+    pivots: dict | None = None, session: str = "",
 ) -> str:
     """Собирает сырые данные всех слоёв в текст для промпта Claude."""
     parts = []
 
+    parts.append(
+        f"15-минутный график (для точности входа): направление {signal_15m.get('direction')}, "
+        f"цена {signal_15m.get('price')}, RSI(14)={signal_15m.get('rsi')}, "
+        f"основания: {', '.join(signal_15m.get('reasons', [])) or 'нет'}."
+        + _macd_atr_note(macd_15m, atr_15m)
+    )
     parts.append(
         f"Часовой график: направление {signal_1h.get('direction')}, "
         f"цена {signal_1h.get('price')}, RSI(14)={signal_1h.get('rsi')}, "
@@ -207,6 +258,16 @@ def build_data_summary(
         f"основания: {', '.join(signal_1d.get('reasons', [])) or 'нет'}."
         + _macd_atr_note(macd_1d, atr_1d)
     )
+
+    if pivots:
+        parts.append(
+            f"Внутридневные уровни (пивоты от вчерашнего дня): "
+            f"R2={pivots['r2']}, R1={pivots['r1']}, PP={pivots['pp']}, S1={pivots['s1']}, S2={pivots['s2']} "
+            f"(классические уровни для входов/стопов дневного трейдера)."
+        )
+
+    if session:
+        parts.append(f"Текущая торговая сессия: {session}.")
 
     if real_yield:
         trend = "выросла" if real_yield["change_since"] > 0 else "снизилась" if real_yield["change_since"] < 0 else "не изменилась"
@@ -239,16 +300,19 @@ def ask_claude_synthesis(data_summary: str) -> str:
         "content-type": "application/json",
     }
     user_prompt = (
-        "Ты аналитик по золоту (XAU/USD). Вот сырые данные, собранные только что:\n\n"
+        "Ты аналитик по золоту (XAU/USD) для дневного трейдера (до 5 сделок в день, "
+        "внутри дня, не позиционная торговля). Вот сырые данные, собранные только что:\n\n"
         f"{data_summary}\n\n"
-        "Кратко проверь через веб-поиск текущий новостной и макроэкономический фон "
-        "(ставки ФРС, инфляционная статистика, геополитика, крупные данные в ближайшие часы). "
-        "Сведи всё это (техника на двух таймфреймах + реальная доходность + золото/серебро + новости) "
-        "в единый разбор на русском для трейдера. Структура ответа:\n"
+        "Проверь через веб-поиск текущий новостной и макроэкономический фон (ставки ФРС, "
+        "инфляционная статистика, геополитика). Отдельно найди экономический календарь "
+        "на СЕГОДНЯ — важно узнать ТОЧНОЕ время публикаций (укажи по МСК), а не только "
+        "какой день недели. Сведи всё в единый разбор на русском. Структура ответа:\n"
         "1. Итоговое направление одним словом (бычье/медвежье/нейтральное) и коротко почему.\n"
-        "2. Что говорит техника (согласны ли часовой и дневной графики между собой).\n"
+        "2. Что говорит техника (согласуются ли 15-минутный, часовой и дневной графики).\n"
         "3. Что говорит макро (доходность, золото/серебро).\n"
-        "4. Риски в ближайшие часы-дни (важные события).\n"
+        "4. Конкретные уровни для входа/стопа — используй присланные пивоты и текущую "
+        "сессию, дай практические цифры (например 'вход от S1, стоп ниже S2'), а не общие слова.\n"
+        "5. Риски сегодня — события с ТОЧНЫМ временем по МСК, если оно есть в календаре.\n"
         "Пиши сжато, по существу, без лишних вступлений."
     )
     payload = {
@@ -271,27 +335,32 @@ def ask_claude_synthesis(data_summary: str) -> str:
 
 async def run_full_analysis() -> str:
     """Собирает все слои данных и возвращает готовый текст ответа."""
-    candles_1h, candles_1d, real_yield, metals = await asyncio.gather(
+    candles_15m, candles_1h, candles_1d, real_yield, metals = await asyncio.gather(
+        asyncio.to_thread(fetch_candles, "15min", 110),
         asyncio.to_thread(fetch_candles, "1h", 110),
         asyncio.to_thread(fetch_candles, "1day", 110),
         asyncio.to_thread(fetch_real_yield),
         asyncio.to_thread(fetch_gold_silver),
     )
 
-    if len(candles_1h) < 60 or len(candles_1d) < 60:
+    if len(candles_15m) < 60 or len(candles_1h) < 60 or len(candles_1d) < 60:
         return "Недостаточно данных по свечам XAU/USD, попробуй чуть позже."
 
+    signal_15m = build_signal(candles_15m)
     signal_1h = build_signal(candles_1h)
     signal_1d = build_signal(candles_1d)
 
-    closes_1h = [c.close for c in candles_1h]
-    closes_1d = [c.close for c in candles_1d]
-    macd_1h, atr_1h = macd(closes_1h), atr(candles_1h)
-    macd_1d, atr_1d = macd(closes_1d), atr(candles_1d)
+    macd_15m, atr_15m = macd([c.close for c in candles_15m]), atr(candles_15m)
+    macd_1h, atr_1h = macd([c.close for c in candles_1h]), atr(candles_1h)
+    macd_1d, atr_1d = macd([c.close for c in candles_1d]), atr(candles_1d)
+
+    pivots = pivot_points(candles_1d)
+    session = current_session()
 
     data_summary = build_data_summary(
-        signal_1h, signal_1d, real_yield, metals,
-        macd_1h, atr_1h, macd_1d, atr_1d,
+        signal_15m, signal_1h, signal_1d, real_yield, metals,
+        macd_15m, atr_15m, macd_1h, atr_1h, macd_1d, atr_1d,
+        pivots, session,
     )
     analysis_text = await asyncio.to_thread(ask_claude_synthesis, data_summary)
 
@@ -302,10 +371,10 @@ async def run_full_analysis() -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Я SkullByte — агент глубокого анализа по золоту (XAU/USD).\n\n"
-        "Напиши что угодно (или /gold) — соберу технику на часовом и дневном "
-        "графике, реальную доходность облигаций, золото/серебро и текущий "
-        "новостной фон, и пришлю разбор."
+        "Я SkullByte — агент глубокого анализа по золоту (XAU/USD) для дневного трейдера.\n\n"
+        "Напиши что угодно (или /gold) — соберу технику на 15-минутном, часовом и дневном "
+        "графике, пивот-уровни на сегодня, текущую сессию, реальную доходность облигаций, "
+        "золото/серебро и точный новостной календарь на сегодня, и пришлю разбор."
     )
 
 
