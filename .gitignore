@@ -1,0 +1,13 @@
+# Секреты — никогда не коммитить
+.env
+
+# Служебные файлы бота
+__pycache__/
+*.pyc
+bot.pid
+bot_run.log
+watchdog.log
+gold_signal_history.json
+
+# Старые сборки/архивы
+dist/
