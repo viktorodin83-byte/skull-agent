@@ -135,8 +135,6 @@ def pivot_points(candles_1d: list[Candle], min_range: float = 15.0) -> dict | No
 
 def current_session() -> str:
     """Текущая торговая сессия по UTC — золото по-разному волатильно в разные сессии."""
-    from datetime import datetime, timezone
-
     hour = datetime.now(timezone.utc).hour
     in_london = 7 <= hour < 16
     in_ny = 12 <= hour < 21
@@ -252,23 +250,61 @@ def _save_history(history: list):
 
 
 def _evaluate_pending(history: list, current_price: float):
-    """Сверяет прогнозы старше _EVAL_HORIZON_HOURS с реальным движением цены."""
+    """Сверяет прогнозы старше _EVAL_HORIZON_HOURS с реальным движением цены.
+
+    Одна повреждённая запись (например, из ручной правки файла) не должна
+    рушить проверку остальных — пропускаем её и логируем, а не падаем целиком.
+    """
     now = datetime.now(timezone.utc)
     for entry in history:
-        if entry["evaluated"]:
-            continue
-        ts = datetime.fromisoformat(entry["timestamp"])
-        hours_passed = (now - ts).total_seconds() / 3600
-        if hours_passed < _EVAL_HORIZON_HOURS:
-            continue
-        entry["evaluated"] = True
-        move_pct = (current_price - entry["price"]) / entry["price"] * 100
-        if entry["direction"] == "бычье":
-            entry["correct"] = move_pct >= _MOVE_THRESHOLD_PCT
-        elif entry["direction"] == "медвежье":
-            entry["correct"] = move_pct <= -_MOVE_THRESHOLD_PCT
-        else:
-            entry["correct"] = abs(move_pct) < _MOVE_THRESHOLD_PCT
+        try:
+            if entry["evaluated"]:
+                continue
+            ts = datetime.fromisoformat(entry["timestamp"])
+            hours_passed = (now - ts).total_seconds() / 3600
+            if hours_passed < _EVAL_HORIZON_HOURS:
+                continue
+            entry["evaluated"] = True
+            move_pct = (current_price - entry["price"]) / entry["price"] * 100
+            if entry["direction"] == "бычье":
+                entry["correct"] = move_pct >= _MOVE_THRESHOLD_PCT
+            elif entry["direction"] == "медвежье":
+                entry["correct"] = move_pct <= -_MOVE_THRESHOLD_PCT
+            else:
+                entry["correct"] = abs(move_pct) < _MOVE_THRESHOLD_PCT
+        except Exception as e:
+            logger.warning(f"[skullbyte] Пропускаю повреждённую запись истории: {e}")
+
+
+_history_lock = asyncio.Lock()
+
+
+async def evaluate_and_get_accuracy(current_price: float) -> float | None:
+    """Под блокировкой: подгружает историю, сверяет старые прогнозы, сохраняет
+    обновление и отдаёт текущую точность. Блокировка — чтобы два параллельных
+    запроса (например, два быстрых сообщения подряд) не затёрли правки друг друга.
+    """
+    async with _history_lock:
+        history = await asyncio.to_thread(_load_history)
+        _evaluate_pending(history, current_price)
+        await asyncio.to_thread(_save_history, history)
+        return _recent_accuracy(history)
+
+
+async def append_history_entry(direction: str, price: float):
+    """Под той же блокировкой: перечитывает актуальную историю (могла обновиться
+    за время, пока ждали ответ Claude) и дописывает новый прогноз.
+    """
+    async with _history_lock:
+        history = await asyncio.to_thread(_load_history)
+        history.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "direction": direction,
+            "price": price,
+            "evaluated": False,
+            "correct": None,
+        })
+        await asyncio.to_thread(_save_history, history)
 
 
 def _recent_accuracy(history: list) -> float | None:
@@ -283,8 +319,12 @@ def _extract_direction(analysis_text: str) -> tuple[str, str]:
     """Достаёт машиночитаемую метку SIGNAL: ... из ответа Claude и убирает
     её из текста, который увидит пользователь. Возвращает (направление, чистый_текст).
     """
-    match = re.search(r"\n?SIGNAL:\s*(BULLISH|BEARISH|NEUTRAL)\s*$", analysis_text.strip())
+    match = re.search(
+        r"\n?[\s*_]*SIGNAL:[\s*_]*(BULLISH|BEARISH|NEUTRAL)[\s*_.]*$",
+        analysis_text.strip(),
+    )
     if not match:
+        logger.warning("[skullbyte] Не нашёл метку SIGNAL в ответе Claude, считаю нейтральным")
         return "нейтральное", analysis_text
     direction_map = {"BULLISH": "бычье", "BEARISH": "медвежье", "NEUTRAL": "нейтральное"}
     direction = direction_map[match.group(1)]
@@ -447,9 +487,7 @@ async def run_full_analysis() -> str:
     # Самообучение: сверяем прошлые прогнозы с текущей ценой ДО того, как спросим
     # Claude — так свежая точность попадает в промпт этого же запроса.
     current_price = signal_1h["price"]
-    history = _load_history()
-    _evaluate_pending(history, current_price)
-    accuracy = _recent_accuracy(history)
+    accuracy = await evaluate_and_get_accuracy(current_price)
 
     data_summary = build_data_summary(
         signal_15m, signal_1h, signal_1d, real_yield, metals,
@@ -459,14 +497,7 @@ async def run_full_analysis() -> str:
     raw_analysis = await asyncio.to_thread(ask_claude_synthesis, data_summary, accuracy)
     direction, analysis_text = _extract_direction(raw_analysis)
 
-    history.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "direction": direction,
-        "price": current_price,
-        "evaluated": False,
-        "correct": None,
-    })
-    _save_history(history)
+    await append_history_entry(direction, current_price)
 
     footer = f"\n\n📊 Точность последних прогнозов: {accuracy:.0%}" if accuracy is not None else (
         "\n\n📊 Точность прогнозов: пока недостаточно данных (нужно время)"
@@ -475,6 +506,31 @@ async def run_full_analysis() -> str:
 
 
 # ---------- Telegram-обработчики ----------
+
+TELEGRAM_MAX_LEN = 4096
+
+
+def _split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> list[str]:
+    """Разбивает текст на части ≤max_len символов — у Telegram жёсткий лимит на
+    сообщение, а разбор с 5 разделами (особенно с уровнями входа/стопа/целей)
+    легко его превышает. Режет по границам абзацев, чтобы не рвать середину мысли.
+    """
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > max_len:
+        split_at = remaining.rfind("\n\n", 0, max_len)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -492,7 +548,14 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[skullbyte] Ошибка анализа: {e}")
         answer = "Что-то пошло не так при сборе анализа, попробуй ещё раз."
-    await thinking_msg.edit_text(answer)
+
+    chunks = _split_message(answer)
+    try:
+        await thinking_msg.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        logger.error(f"[skullbyte] Ошибка отправки ответа в Telegram: {e}")
 
 
 def main():
