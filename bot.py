@@ -840,16 +840,14 @@ async def apply_and_send_edit(update: Update, context: ContextTypes.DEFAULT_TYPE
 # нода начинает требовать более сильного подтверждения (больше оснований)
 # перед отправкой следующего сигнала.
 #
-# ИИ-советник: индикаторы видят только цену и не видят новостной/макро фон
-# (ставки, статистика, геополитика), поэтому на каждый реальный (не нейтральный)
-# сигнал отдельно спрашиваем Claude с доступом к веб-поиску — не противоречит ли
-# текущий новостной фон техническому сигналу. Это только комментарий к сообщению,
-# он не подавляет и не переопределяет решение индикаторов.
+# ИИ-советник (Claude + веб-поиск) отсюда убран — глубокий, многослойный анализ
+# (мультитаймфрейм, макро, золото/серебро, новости) теперь делает отдельный
+# агент SkullByte (skullbyte.py) по запросу. Эта нода отдаёт только быстрый
+# механический сигнал по индикаторам, без вызовов ИИ.
 # ======================================================================
 
 _GOLD_TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
 _GOLD_CHAT_ID = 7684813527
-_GOLD_ADVISOR_MODEL = "claude-opus-5"
 
 _GOLD_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gold_signal_history.json")
 _GOLD_EVAL_HORIZON_HOURS = 4        # через сколько часов проверяем, сбылся ли сигнал
@@ -943,54 +941,6 @@ def _gold_fetch_candles(outputsize: int = 110) -> list:
         return []
 
 
-def _gold_ai_advisor(signal: dict) -> str | None:
-    """Спрашивает Claude (с доступом к веб-поиску) — не противоречит ли текущий
-    новостной/макро фон техническому сигналу. Блокирующая функция.
-
-    Индикаторы (RSI/MA/Фибоначчи/канал) видят только цену, поэтому эта проверка
-    не пересчитывает их и не подменяет их вывод — она только добавляет контекст,
-    которого у чистой математики нет. Возвращает короткий комментарий на русском
-    для добавления к сообщению, либо None при любом сбое (сигнал в этом случае
-    всё равно уходит — просто без комментария советника).
-    """
-    reasons_text = "; ".join(signal["reasons"]) or "нет явных оснований"
-    user_prompt = (
-        f"Технический сигнал по золоту (XAU/USD): направление — {signal['direction']}, "
-        f"цена {signal['price']}, RSI(14)={signal['rsi']}, MA20={signal['ma20']}, MA50={signal['ma50']}. "
-        f"Основания индикаторов: {reasons_text}.\n\n"
-        "Кратко проверь через веб-поиск текущий новостной и макроэкономический фон "
-        "по золоту (решения по ставкам, инфляционная статистика, геополитика, "
-        "крупные данные в ближайшие часы). Ответь на русском, 2-3 предложения, "
-        "начни СТРОГО с одного слова: 'СОГЛАСЕН' — если новостной фон не противоречит "
-        "техническому сигналу, или 'ОСТОРОЖНО' — если есть заметный риск, который может "
-        "перебить технику."
-    )
-
-    url = "https://api.anthropic.com/v1/messages"
-    headers = {
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
-    payload = {
-        "model": _GOLD_ADVISOR_MODEL,
-        "max_tokens": 1024,
-        "tools": [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}],
-        "messages": [{"role": "user", "content": user_prompt}],
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-        text_parts = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
-        text = "\n".join(part.strip() for part in text_parts).strip()
-        return text or None
-    except Exception as e:
-        logger.warning(f"[gold] ИИ-советник недоступен: {e}")
-        return None
-
-
 async def check_gold_signal(context: ContextTypes.DEFAULT_TYPE):
     """Фоновая задача JobQueue: раз в час проверяет технический сигнал по золоту и шлёт его в чат.
 
@@ -1047,10 +997,6 @@ async def check_gold_signal(context: ContextTypes.DEFAULT_TYPE):
     message = format_signal_message(signal)
     if accuracy is not None:
         message += f"\n\nТочность последних сигналов: {accuracy:.0%}"
-
-    advisor_note = await asyncio.to_thread(_gold_ai_advisor, signal)
-    if advisor_note:
-        message += f"\n\n🤖 {advisor_note}"
 
     await context.bot.send_message(chat_id=_GOLD_CHAT_ID, text=message)
 
