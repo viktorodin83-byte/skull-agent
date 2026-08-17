@@ -46,6 +46,55 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ---------- Дополнительные индикаторы (только для этого агента) ----------
+#
+# RSI/MA/Фибоначчи/канал уже даёт analysis.py (общий для обоих ботов) — они
+# видят "перекупленность" и "тренд по пересечению". Тут добавлены две вещи,
+# которых там нет: MACD (импульс/ускорение движения) и ATR (волатильность,
+# чтобы оценивать движения относительно текущей нормы, а не в вакууме).
+
+def _ema(values: list[float], period: int) -> list[float]:
+    """Экспоненциальная скользящая средняя. Первое значение — простая SMA."""
+    if len(values) < period:
+        return []
+    ema_values = [sum(values[:period]) / period]
+    multiplier = 2 / (period + 1)
+    for price in values[period:]:
+        ema_values.append((price - ema_values[-1]) * multiplier + ema_values[-1])
+    return ema_values
+
+
+def macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict | None:
+    """MACD: импульс тренда. Возвращает линию MACD, сигнальную линию и гистограмму."""
+    if len(closes) < slow + signal:
+        return None
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    offset = len(ema_fast) - len(ema_slow)
+    macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
+    signal_line = _ema(macd_line, signal)
+    if not signal_line:
+        return None
+    histogram = macd_line[-1] - signal_line[-1]
+    return {
+        "macd": round(macd_line[-1], 2),
+        "signal": round(signal_line[-1], 2),
+        "histogram": round(histogram, 2),
+        "momentum": "растёт" if histogram > 0 else "падает",
+    }
+
+
+def atr(candles: list[Candle], period: int = 14) -> float | None:
+    """Средний истинный диапазон — мера текущей волатильности в долларах."""
+    if len(candles) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high, low, prev_close = candles[i].high, candles[i].low, candles[i - 1].close
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return round(sum(true_ranges[-period:]) / period, 2)
+
+
 # ---------- Сбор данных ----------
 
 def fetch_candles(interval: str, outputsize: int = 110) -> list[Candle]:
@@ -127,7 +176,22 @@ def fetch_gold_silver() -> dict:
 
 # ---------- Синтез ----------
 
-def build_data_summary(signal_1h: dict, signal_1d: dict, real_yield: dict, metals: dict) -> str:
+def _macd_atr_note(macd_data: dict | None, atr_value: float | None) -> str:
+    if not macd_data and not atr_value:
+        return ""
+    bits = []
+    if macd_data:
+        bits.append(f"MACD: гистограмма {macd_data['histogram']}, импульс {macd_data['momentum']}")
+    if atr_value:
+        bits.append(f"ATR(14): ${atr_value} (текущий размах волатильности)")
+    return " " + "; ".join(bits) + "."
+
+
+def build_data_summary(
+    signal_1h: dict, signal_1d: dict, real_yield: dict, metals: dict,
+    macd_1h: dict | None = None, atr_1h: float | None = None,
+    macd_1d: dict | None = None, atr_1d: float | None = None,
+) -> str:
     """Собирает сырые данные всех слоёв в текст для промпта Claude."""
     parts = []
 
@@ -135,11 +199,13 @@ def build_data_summary(signal_1h: dict, signal_1d: dict, real_yield: dict, metal
         f"Часовой график: направление {signal_1h.get('direction')}, "
         f"цена {signal_1h.get('price')}, RSI(14)={signal_1h.get('rsi')}, "
         f"основания: {', '.join(signal_1h.get('reasons', [])) or 'нет'}."
+        + _macd_atr_note(macd_1h, atr_1h)
     )
     parts.append(
         f"Дневной график: направление {signal_1d.get('direction')}, "
         f"цена {signal_1d.get('price')}, RSI(14)={signal_1d.get('rsi')}, "
         f"основания: {', '.join(signal_1d.get('reasons', [])) or 'нет'}."
+        + _macd_atr_note(macd_1d, atr_1d)
     )
 
     if real_yield:
@@ -218,7 +284,15 @@ async def run_full_analysis() -> str:
     signal_1h = build_signal(candles_1h)
     signal_1d = build_signal(candles_1d)
 
-    data_summary = build_data_summary(signal_1h, signal_1d, real_yield, metals)
+    closes_1h = [c.close for c in candles_1h]
+    closes_1d = [c.close for c in candles_1d]
+    macd_1h, atr_1h = macd(closes_1h), atr(candles_1h)
+    macd_1d, atr_1d = macd(closes_1d), atr(candles_1d)
+
+    data_summary = build_data_summary(
+        signal_1h, signal_1d, real_yield, metals,
+        macd_1h, atr_1h, macd_1d, atr_1d,
+    )
     analysis_text = await asyncio.to_thread(ask_claude_synthesis, data_summary)
 
     return f"🪙 Разбор по XAU/USD\n\n{analysis_text}"
