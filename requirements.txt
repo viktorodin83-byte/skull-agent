@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==21.6
+python-telegram-bot[job-queue]==22.8
 duckduckgo-search==6.3.5
 requests==2.32.3
 Pillow==12.3.0
